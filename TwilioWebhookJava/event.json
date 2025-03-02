@@ -1,0 +1,13 @@
+{
+    "resource": "/webhook",
+    "path": "/webhook",
+    "httpMethod": "POST",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "queryStringParameters": {},
+    "pathParameters": {},
+    "body": "From=%2B1234567890&Body=make%20coffee",
+    "isBase64Encoded": false
+  }
+  

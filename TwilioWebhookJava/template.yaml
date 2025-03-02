@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM Template for Twilio WhatsApp Webhook Lambda in Java 21 with ChatGPT integration using Secrets Manager
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 512
+
+Resources:
+  TwilioWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: com.adlanda.TwilioWebhookLambda::handleRequest
+      Runtime: java21
+      CodeUri: TwilioWebhookLambda
+      Environment:
+        Variables:
+          # Set this to the name or ARN of the secret that stores your OpenAI API key
+          OPENAI_SECRET_ID: "OpenAiApiKey"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action: "secretsmanager:GetSecretValue"
+              Resource: "*"  # For tighter security, replace "*" with the secret's ARN
+      Events:
+        TwilioWebhookEvent:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: post
+
+Outputs:
+  TwilioWebhookApi:
+    Description: "API Gateway endpoint URL for the Twilio Webhook"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook"
