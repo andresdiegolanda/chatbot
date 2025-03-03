@@ -14,9 +14,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 import static org.junit.jupiter.api.Assertions.*;
 
-
-
-
 /**
  * Additional tests have been added while retaining existing tests.
  */
@@ -35,7 +32,7 @@ public class TwilioWebhookLambdaTest {
     }
 
     @Test
-    public void testHandleRequestWithValidMessage() {
+    public void handleRequestShouldReturn200StatusAndXmlResponseWhenValidMessageProvided() {
         APIGatewayProxyRequestEvent requestEvent = new APIGatewayProxyRequestEvent();
         requestEvent.setBody("From=%2B1234567890&Body=Hello");
         requestEvent.setIsBase64Encoded(false);
@@ -56,7 +53,7 @@ public class TwilioWebhookLambdaTest {
     }
 
     @Test
-    public void testHandleRequestWithBase64EncodedMessage() {
+    public void handleRequestShouldReturn200StatusAndXmlResponseWhenBase64EncodedMessageProvided() {
         APIGatewayProxyRequestEvent requestEvent = new APIGatewayProxyRequestEvent();
         String encodedBody = Base64.getEncoder().encodeToString("From=%2B1234567890&Body=Hello".getBytes());
         requestEvent.setBody(encodedBody);
@@ -74,7 +71,7 @@ public class TwilioWebhookLambdaTest {
     }
 
     @Test
-    public void testHandleRequestWithMissingApiKey() {
+    public void handleRequestShouldReturn500StatusAndErrorMessageWhenApiKeyIsMissing() {
         // Instead of spying (which causes issues on Java 22),
         // extend the Lambda to override getOpenAiApiKey
         TwilioWebhookLambda missingKeyLambda = new TwilioWebhookLambda() {
@@ -98,9 +95,8 @@ public class TwilioWebhookLambdaTest {
         assertEquals("<Response><Message>Error: API key unavailable.</Message></Response>", responseEvent.getBody());
     }
 
-    // Additional test: when body is empty
     @Test
-    public void testHandleRequestWithEmptyBody() {
+    public void handleRequestShouldReturn200StatusAndXmlResponseWhenEmptyBodyProvided() {
         APIGatewayProxyRequestEvent requestEvent = new APIGatewayProxyRequestEvent();
         requestEvent.setBody("");
         requestEvent.setIsBase64Encoded(false);
@@ -120,9 +116,8 @@ public class TwilioWebhookLambdaTest {
         assertTrue(responseEvent.getBody().contains("</Message></Response>"));
     }
 
-    // Additional test: when base64--encoded body is invalid
     @Test
-    public void testHandleRequestWithInvalidBase64() {
+    public void handleRequestShouldThrowIllegalArgumentExceptionWhenBase64EncodedBodyIsInvalid() {
         APIGatewayProxyRequestEvent requestEvent = new APIGatewayProxyRequestEvent();
         // Provide an invalid base64 encoded string
         requestEvent.setBody("!!!invalidbase64@@@");

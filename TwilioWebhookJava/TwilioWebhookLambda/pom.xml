@@ -1,21 +1,21 @@
-<project xmlns="http://maven.apache.org/POM/4.0.0"
+<project xmlns="http://maven.apache.org/POM/4.0.0" 
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
          http://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
   
+  <modelVersion>4.0.0</modelVersion>
   <groupId>com.adlanda</groupId>
   <artifactId>TwilioWebhookLambda</artifactId>
   <version>1.0-SNAPSHOT</version>
   <packaging>jar</packaging>
-
+  
   <properties>
-    <!-- Use the release flag to target Java 21 -->
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <junit.jupiter.version>5.9.2</junit.jupiter.version>
+    <!-- Format for the build timestamp -->
+    <maven.build.timestamp.format>yyyy-MM-dd HH:mm:ss</maven.build.timestamp.format>
   </properties>
-
+  
   <dependencies>
     <!-- AWS Lambda Java Core -->
     <dependency>
@@ -33,7 +33,7 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>${junit.jupiter.version}</version>
+      <version>5.9.2</version>
       <scope>test</scope>
     </dependency>
     <!-- Mockito for testing -->
@@ -56,8 +56,16 @@
       <version>2.20.19</version>
     </dependency>
   </dependencies>
-
+  
   <build>
+    <!-- Enable filtering for resources so that version.properties is processed -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
+    
     <plugins>
       <!-- Maven Compiler Plugin using the release flag -->
       <plugin>
@@ -67,7 +75,8 @@
           <release>21</release>
         </configuration>
       </plugin>
-      <!-- Maven Shade Plugin to create a fat JAR -->
+      
+      <!-- Maven Shade Plugin for creating a fat JAR -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
@@ -81,7 +90,6 @@
             <configuration>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <!-- Update this to your handler's fully-qualified class name -->
                   <mainClass>com.adlanda.TwilioWebhookLambda</mainClass>
                 </transformer>
               </transformers>
@@ -89,15 +97,42 @@
           </execution>
         </executions>
       </plugin>
-      <!-- Maven Surefire Plugin to run tests -->
+      
+      <!-- Maven Surefire Plugin for running tests -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.0.0-M7</version>
+      </plugin>
+      
+      <!-- Build Number Plugin to create a timestamp property -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>buildnumber-maven-plugin</artifactId>
+        <version>1.4</version>
+        <executions>
+          <execution>
+            <phase>validate</phase>
+            <goals>
+              <goal>create</goal>
+            </goals>
+          </execution>
+        </executions>
         <configuration>
-          <!-- skipTests is not set so tests will compile and execute -->
+          <!-- Disable SCM checks to avoid null scm url error -->
+          <doCheck>false</doCheck>
+          <doUpdate>false</doUpdate>
+          <timestampPropertyName>maven.build.timestamp</timestampPropertyName>
+          <timestampFormat>${maven.build.timestamp.format}</timestampFormat>
         </configuration>
       </plugin>
     </plugins>
   </build>
+
+  <!-- Optional SCM section with dummy values to satisfy plugins -->
+  <scm>
+    <connection>scm:git:git://dummy</connection>
+    <developerConnection>scm:git:ssh://dummy</developerConnection>
+    <url>http://dummy</url>
+  </scm>
 </project>
