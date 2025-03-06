@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  SAM Template for Twilio WhatsApp Webhook Lambda in Java 21 with ChatGPT integration using Secrets Manager
+  SAM Template for Twilio WhatsApp Webhook Lambda in Java 21 with ChatGPT integration and audio processing
 
 Globals:
   Function:
-    Timeout: 10
+    Timeout: 300  # Increase timeout to allow for transcription job polling
     MemorySize: 512
 
 Resources:
@@ -17,14 +17,27 @@ Resources:
       CodeUri: TwilioWebhookLambda
       Environment:
         Variables:
-          # Set this to the name or ARN of the secret that stores your OpenAI API key
           OPENAI_SECRET_ID: "OpenAiApiKey"
       Policies:
         - Version: "2012-10-17"
           Statement:
-            - Effect: "Allow"
-              Action: "secretsmanager:GetSecretValue"
-              Resource: "*"  # For tighter security, replace "*" with the secret's ARN
+            - Sid: "AllowSecretsManagerAccess"
+              Effect: "Allow"
+              Action:
+                - "secretsmanager:GetSecretValue"
+              Resource: "*"   # Ideally, restrict to your secret's ARN
+            - Sid: "AllowS3AccessForAudioMessages"
+              Effect: "Allow"
+              Action:
+                - "s3:PutObject"
+                - "s3:GetObject"
+              Resource: "arn:aws:s3:::twilio-audio-messages-eu-west-1-andreslandaaws/*"
+            - Sid: "AllowTranscribeAccess"
+              Effect: "Allow"
+              Action:
+                - "transcribe:StartTranscriptionJob"
+                - "transcribe:GetTranscriptionJob"
+              Resource: "*"  # Ideally, restrict further if possible
       Events:
         TwilioWebhookEvent:
           Type: Api
