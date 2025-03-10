@@ -55,20 +55,27 @@
       <artifactId>secretsmanager</artifactId>
       <version>2.20.19</version>
     </dependency>
+    <!-- JAVE dependency -->
+    <!-- https://mvnrepository.com/artifact/ws.schild/jave-core -->
+<!-- https://mvnrepository.com/artifact/ws.schild/jave-core -->
+<dependency>
+    <groupId>ws.schild</groupId>
+    <artifactId>jave-core</artifactId>
+    <version>3.5.0</version>
+</dependency>
 
-    <!-- AWS SDK v2 for S3 -->
     <dependency>
-        <groupId>software.amazon.awssdk</groupId>
-        <artifactId>s3</artifactId>
-        <version>2.20.25</version>
-    </dependency>
-    
-    <!-- AWS SDK v2 for Transcribe -->
-    <dependency>
-        <groupId>software.amazon.awssdk</groupId>
-        <artifactId>transcribe</artifactId>
-        <version>2.20.25</version>
-    </dependency>    
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.20.19</version>
+</dependency>
+
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>transcribe</artifactId>
+    <version>2.20.19</version>
+</dependency>
+
   </dependencies>
   
   <build>

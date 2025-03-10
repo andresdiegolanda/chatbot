@@ -6,7 +6,6 @@ import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
@@ -18,7 +17,12 @@ import software.amazon.awssdk.services.transcribe.model.Media;
 import software.amazon.awssdk.services.transcribe.model.StartTranscriptionJobRequest;
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobRequest;
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobResponse;
+import ws.schild.jave.Encoder;
+import ws.schild.jave.MultimediaObject;
+import ws.schild.jave.encode.AudioAttributes;
+import ws.schild.jave.encode.EncodingAttributes;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -32,7 +36,6 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.time.Duration;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
@@ -49,80 +52,174 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         Map<String, String> responseHeaders = new HashMap<>();
         responseHeaders.put("Content-Type", "application/xml");
 
-        // Get the raw body, decode if necessary
-        String rawBody = event.getBody();
-        if (event.getIsBase64Encoded() != null && event.getIsBase64Encoded()) {
-            rawBody = new String(Base64.getDecoder().decode(rawBody));
-        }
-        context.getLogger().log("Raw body: " + rawBody);
+        try {
+            String rawBody = event.getBody();
+            if (event.getIsBase64Encoded() != null && event.getIsBase64Encoded()) {
+                rawBody = new String(Base64.getDecoder().decode(rawBody));
+            }
+            context.getLogger().log("Raw body: " + rawBody);
 
-        // Parse form data
-        Map<String, String> params = parseFormData(rawBody);
-        String from = params.getOrDefault("From", "Unknown");
-        String messageBody = params.getOrDefault("Body", "").trim();
-        String mediaUrl = params.get("MediaUrl0"); // Audio message URL
+            Map<String, String> params = parseFormData(rawBody);
+            String from = params.getOrDefault("From", "Unknown");
+            String messageBody = params.getOrDefault("Body", "").trim();
+            String mediaUrl = params.get("MediaUrl0");
 
-        context.getLogger().log("Received message from " + from + " with content: " + messageBody);
+            context.getLogger().log("Received message from " + from + " with content: " + messageBody);
 
-        // Handle version info request
-        if (messageBody.equalsIgnoreCase("lambda version")) {
-            String versionInfo = getLambdaVersionInfo();
-            return new APIGatewayProxyResponseEvent()
-                    .withStatusCode(200)
-                    .withHeaders(responseHeaders)
-                    .withBody("<Response><Message>" + versionInfo + "</Message></Response>");
-        }
-
-        String textToProcess;
-        if (mediaUrl != null && !mediaUrl.isEmpty()) {
-            // Process audio message
-            context.getLogger().log("Audio message detected. MediaUrl: " + mediaUrl);
-            try {
-                byte[] audioData = downloadAudio(mediaUrl, context);
-                context.getLogger().log("Downloaded audio size: " + audioData.length + " bytes");
-                String s3Uri = uploadAudioToS3(audioData, context);
-                context.getLogger().log("Audio uploaded to S3. S3 URI: " + s3Uri);
-                textToProcess = transcribeAudio(s3Uri, context);
-                context.getLogger().log("Transcribed text: " + textToProcess);
-            } catch (Exception e) {
-                context.getLogger().log("Error processing audio: " + e.getMessage());
-                StringWriter sw = new StringWriter();
-                e.printStackTrace(new PrintWriter(sw));
-                String stackTrace = sw.toString();
-                String errorResponse = "<Response><Message>Error transcribing audio message: " 
-                        + e.getMessage() + "\n" + stackTrace + "</Message></Response>";
+            if (messageBody.equalsIgnoreCase("lambda version")) {
+                String versionInfo = getLambdaVersionInfo();
                 return new APIGatewayProxyResponseEvent()
                         .withStatusCode(200)
                         .withHeaders(responseHeaders)
-                        .withBody(errorResponse);
+                        .withBody("<Response><Message>" + escapeXml(versionInfo) + "</Message></Response>");
             }
-        } else {
-            textToProcess = messageBody;
-        }
-        context.getLogger().log("Final text to process: " + textToProcess);
 
-        String openAiApiKey = getOpenAiApiKey(context);
-        if (openAiApiKey == null || openAiApiKey.isEmpty()) {
-            context.getLogger().log("Failed to retrieve OpenAI API key.");
+            if (mediaUrl != null && !mediaUrl.isEmpty()) {
+                StringBuilder debugLog = new StringBuilder();
+                boolean errorOccurred = false;
+                try {
+                    debugLog.append("Media URL: ").append(mediaUrl).append("\n");
+
+                    // Step 1: Download audio.
+                    byte[] audioData = null;
+                    try {
+                        debugLog.append("Step 1: Downloading audio...\n");
+                        audioData = downloadAudio(mediaUrl, context, debugLog);
+                        debugLog.append("Audio downloaded. Size: ").append(audioData.length).append(" bytes.\n");
+                    } catch (Exception e) {
+                        debugLog.append("Error downloading audio: ").append(e.getMessage()).append("\n")
+                                .append(getStackTrace(e)).append("\n");
+                        errorOccurred = true;
+                    }
+
+                    // Step 2: Save audio to temporary OGG file.
+                    Path tempOggFile = null;
+                    if (audioData != null) {
+                        try {
+                            debugLog.append("Step 2: Saving audio to temporary OGG file...\n");
+                            tempOggFile = Files.createTempFile("audio", ".ogg");
+                            Files.write(tempOggFile, audioData, StandardOpenOption.WRITE);
+                            debugLog.append("Temporary OGG file created at ")
+                                    .append(tempOggFile.toString())
+                                    .append(" (").append(Files.size(tempOggFile)).append(" bytes).\n");
+                        } catch (Exception e) {
+                            debugLog.append("Error saving to OGG file: ").append(e.getMessage()).append("\n")
+                                    .append(getStackTrace(e)).append("\n");
+                            errorOccurred = true;
+                        }
+                    }
+
+                    // Step 3: Convert OGG to MP3.
+                    Path tempMp3File = null;
+                    if (tempOggFile != null) {
+                        try {
+                            debugLog.append("Step 3: Converting OGG to MP3...\n");
+                            tempMp3File = convertOggToMp3(tempOggFile, context);
+                            debugLog.append("Conversion complete. MP3 file at ")
+                                    .append(tempMp3File.toString())
+                                    .append(" (").append(Files.size(tempMp3File)).append(" bytes).\n");
+                        } catch (Exception e) {
+                            debugLog.append("Error converting to MP3: ").append(e.getMessage()).append("\n")
+                                    .append(getStackTrace(e)).append("\n");
+                            errorOccurred = true;
+                        } finally {
+                            try {
+                                Files.deleteIfExists(tempOggFile);
+                                debugLog.append("Temporary OGG file deleted.\n");
+                            } catch (Exception e) {
+                                debugLog.append("Error deleting OGG file: ").append(e.getMessage()).append("\n")
+                                        .append(getStackTrace(e)).append("\n");
+                            }
+                        }
+                    }
+
+                    // Step 4: Upload MP3 to S3.
+                    String s3Uri = null;
+                    if (tempMp3File != null) {
+                        try {
+                            debugLog.append("Step 4: Uploading MP3 to S3...\n");
+                            s3Uri = uploadAudioToS3(tempMp3File, context);
+                            debugLog.append("Uploaded to S3. S3 URI: ").append(s3Uri).append("\n");
+                        } catch (Exception e) {
+                            debugLog.append("Error uploading MP3: ").append(e.getMessage()).append("\n")
+                                    .append(getStackTrace(e)).append("\n");
+                            errorOccurred = true;
+                        } finally {
+                            try {
+                                Files.deleteIfExists(tempMp3File);
+                                debugLog.append("Temporary MP3 file deleted.\n");
+                            } catch (Exception e) {
+                                debugLog.append("Error deleting MP3 file: ").append(e.getMessage()).append("\n")
+                                        .append(getStackTrace(e)).append("\n");
+                            }
+                        }
+                    }
+
+                    // Step 5: Transcribe.
+                    if (s3Uri != null) {
+                        try {
+                            debugLog.append("Step 5: Starting transcription job...\n");
+                            String transcript = transcribeAudio(s3Uri, context);
+                            debugLog.append("Transcription complete. Transcript: ").append(transcript).append("\n");
+                        } catch (Exception e) {
+                            debugLog.append("Error transcribing audio: ").append(e.getMessage()).append("\n")
+                                    .append(getStackTrace(e)).append("\n");
+                            errorOccurred = true;
+                        }
+                    }
+                } catch (Exception ex) {
+                    debugLog.append("Unhandled exception in audio processing: ").append(ex.getMessage()).append("\n")
+                            .append(getStackTrace(ex)).append("\n");
+                    errorOccurred = true;
+                }
+                context.getLogger().log("Final debug log: " + debugLog.toString());
+                String responseBody;
+                if (errorOccurred) {
+                    responseBody = "<Response><Message>Error processing audio file</Message></Response>";
+                } else {
+                    responseBody = "<Response><Message>" + escapeXml(debugLog.toString()) + "</Message></Response>";
+                }
+                return new APIGatewayProxyResponseEvent()
+                        .withStatusCode(200)
+                        .withHeaders(responseHeaders)
+                        .withBody(responseBody);
+            }
+
+            // Non-audio branch:
+            String textToProcess = messageBody;
+            context.getLogger().log("Final text to process: " + textToProcess);
+
+            String openAiApiKey = getOpenAiApiKey(context);
+            if (openAiApiKey == null || openAiApiKey.isEmpty()) {
+                context.getLogger().log("Failed to retrieve OpenAI API key.");
+                return new APIGatewayProxyResponseEvent()
+                        .withStatusCode(500)
+                        .withHeaders(responseHeaders)
+                        .withBody("<Response><Message>" + escapeXml("Error: API key unavailable.") + "</Message></Response>");
+            }
+
+            String chatGptResponse = callChatGpt(textToProcess, openAiApiKey, context);
+            if (chatGptResponse == null || chatGptResponse.trim().isEmpty()) {
+                chatGptResponse = "No response from ChatGPT.";
+                context.getLogger().log("ChatGPT returned an empty response. Using fallback message.");
+            }
+            context.getLogger().log("ChatGPT response: " + chatGptResponse);
+
+            String twimlResponse = "<Response><Message>" + escapeXml(chatGptResponse) + "</Message></Response>";
+            return new APIGatewayProxyResponseEvent()
+                    .withStatusCode(200)
+                    .withHeaders(responseHeaders)
+                    .withBody(twimlResponse);
+        } catch (Exception e) {
+            context.getLogger().log("Unhandled exception in handleRequest: " + e.getMessage());
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            String errorResponse = "<Response><Message>" + escapeXml("Unhandled exception: " + e.getMessage() + "\n" + sw.toString()) + "</Message></Response>";
             return new APIGatewayProxyResponseEvent()
                     .withStatusCode(500)
                     .withHeaders(responseHeaders)
-                    .withBody("<Response><Message>Error: API key unavailable.</Message></Response>");
+                    .withBody(errorResponse);
         }
-
-        String chatGptResponse = callChatGpt(textToProcess, openAiApiKey, context);
-        // If ChatGPT returns an empty response, use a fallback message.
-        if (chatGptResponse == null || chatGptResponse.trim().isEmpty()) {
-            chatGptResponse = "No response from ChatGPT.";
-            context.getLogger().log("ChatGPT returned an empty response. Using fallback message.");
-        }
-        context.getLogger().log("ChatGPT response: " + chatGptResponse);
-
-        String twimlResponse = "<Response><Message>" + chatGptResponse + "</Message></Response>";
-        return new APIGatewayProxyResponseEvent()
-                .withStatusCode(200)
-                .withHeaders(responseHeaders)
-                .withBody(twimlResponse);
     }
 
     private Map<String, String> parseFormData(String data) {
@@ -140,31 +237,81 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return map;
     }
 
-    private byte[] downloadAudio(String mediaUrl, Context context) throws IOException, InterruptedException {
+    // Retrieve Twilio credentials from AWS Secrets Manager.
+    private Map<String, String> getTwilioCredentials(Context context) {
+        String secretName = "Twilio";
+        Region region = Region.of("eu-west-1");
+        SecretsManagerClient client = SecretsManagerClient.builder().region(region).build();
+        try {
+            GetSecretValueRequest request = GetSecretValueRequest.builder()
+                    .secretId(secretName)
+                    .build();
+            GetSecretValueResponse response = client.getSecretValue(request);
+            String secret = response.secretString();
+            JsonNode jsonNode = objectMapper.readTree(secret);
+            Map<String, String> credentials = new HashMap<>();
+            credentials.put("accountSid", jsonNode.get("TWILIO_ACCOUNT_SID").asText());
+            credentials.put("authToken", jsonNode.get("TWILIO_AUTH_TOKEN").asText());
+            return credentials;
+        } catch (Exception e) {
+            context.getLogger().log("Error retrieving Twilio credentials: " + e.getMessage());
+            return null;
+        } finally {
+            client.close();
+        }
+    }
+
+    private byte[] downloadAudio(String mediaUrl, Context context, StringBuilder debugLog) throws IOException, InterruptedException {
+        Map<String, String> creds = getTwilioCredentials(context);
+        if (creds == null || !creds.containsKey("accountSid") || !creds.containsKey("authToken")) {
+            throw new IOException("Twilio credentials not available.");
+        }
+        String credentials = creds.get("accountSid") + ":" + creds.get("authToken");
+        String encodedCredentials = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(mediaUrl))
+                .header("Authorization", "Basic " + encodedCredentials)
                 .build();
         HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        debugLog.append("Twilio Response Code: ").append(response.statusCode()).append("\n");
+        debugLog.append("Twilio Response Headers: ").append(response.headers().map().toString()).append("\n");
         context.getLogger().log("downloadAudio: Received audio data of length: " + response.body().length);
         return response.body();
     }
 
-    private String uploadAudioToS3(byte[] audioData, Context context) throws IOException {
+    private String uploadAudioToS3(Path audioFilePath, Context context) throws IOException {
         String bucketName = "twilio-audio-messages-eu-west-1-andreslandaaws";
         String key = "transcribe/" + System.currentTimeMillis() + ".mp3";
-
-        Path tempFile = Files.createTempFile("audio", ".mp3");
-        Files.write(tempFile, audioData, StandardOpenOption.WRITE);
-        context.getLogger().log("uploadAudioToS3: Temp file created at " + tempFile.toString() + " with size " + Files.size(tempFile) + " bytes");
-
+        context.getLogger().log("uploadAudioToS3: Uploading file " + audioFilePath.toString()
+                + " of size " + Files.size(audioFilePath) + " bytes");
         try (S3Client s3 = S3Client.builder().region(Region.of("eu-west-1")).build()){
             PutObjectRequest putReq = PutObjectRequest.builder()
                     .bucket(bucketName)
                     .key(key)
                     .build();
-            s3.putObject(putReq, tempFile);
+            s3.putObject(putReq, audioFilePath);
         }
         return "s3://" + bucketName + "/" + key;
+    }
+
+    private Path convertOggToMp3(Path sourceOgg, Context context) throws Exception {
+        Path targetMp3 = Files.createTempFile("audio-converted", ".mp3");
+        File sourceFile = sourceOgg.toFile();
+        File targetFile = targetMp3.toFile();
+
+        AudioAttributes audio = new AudioAttributes();
+        audio.setCodec("libmp3lame");
+        audio.setBitRate(128000);
+        audio.setChannels(2);
+        audio.setSamplingRate(44100);
+
+        EncodingAttributes attrs = new EncodingAttributes();
+        attrs.setAudioAttributes(audio);
+
+        Encoder encoder = new Encoder();
+        encoder.encode(new MultimediaObject(sourceFile), targetFile, attrs);
+        context.getLogger().log("Converted audio file to MP3. Output file: " + targetMp3 + ", size: " + Files.size(targetMp3));
+        return targetMp3;
     }
 
     private String transcribeAudio(String s3Uri, Context context) throws InterruptedException, IOException {
@@ -186,13 +333,11 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         .build();
                 GetTranscriptionJobResponse getResponse = transcribeClient.getTranscriptionJob(getRequest);
                 jobStatus = getResponse.transcriptionJob().transcriptionJobStatusAsString();
-                // Log each poll attempt with status.
                 context.getLogger().log("transcribeAudio: Poll attempt " + (attempts + 1) + ", status: " + jobStatus);
                 if ("COMPLETED".equals(jobStatus)) {
                     break;
                 } else if ("FAILED".equals(jobStatus)) {
-                    throw new RuntimeException("Transcription job failed: " +
-                            getResponse.transcriptionJob().failureReason());
+                    throw new RuntimeException("Transcription job failed: " + getResponse.transcriptionJob().failureReason());
                 }
                 Thread.sleep(10000);
                 attempts++;
@@ -254,8 +399,8 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
             String requestBody = objectMapper.writeValueAsString(Map.of(
                     "model", "gpt-3.5-turbo",
                     "messages", new Object[] {
-                        Map.of("role", "system", "content", "You are ChatGPT."),
-                        Map.of("role", "user", "content", prompt)
+                            Map.of("role", "system", "content", "You are ChatGPT."),
+                            Map.of("role", "user", "content", prompt)
                     },
                     "temperature", 0.7
             ));
@@ -279,14 +424,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
             }
         } catch (IOException | InterruptedException e) {
             context.getLogger().log("Error calling ChatGPT API: " + e.getMessage());
-            return "Error calling ChatGPT API.";
+            return "Error calling ChatGPT API: " + e.getMessage() + "\n" + getStackTrace(e);
         }
     }
 
-    /**
-     * Loads version information from version.properties.
-     * Returns a clear message if not available.
-     */
     protected String getLambdaVersionInfo() {
         Properties properties = new Properties();
         try (InputStream in = getClass().getClassLoader().getResourceAsStream("version.properties")) {
@@ -302,5 +443,20 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         } catch (IOException e) {
             return "Error loading version information: " + e.getMessage();
         }
+    }
+
+    private String getStackTrace(Exception e) {
+        StringWriter sw = new StringWriter();
+        e.printStackTrace(new PrintWriter(sw));
+        return sw.toString();
+    }
+
+    private String escapeXml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&apos;");
     }
 }
