@@ -17,10 +17,6 @@ import software.amazon.awssdk.services.transcribe.model.Media;
 import software.amazon.awssdk.services.transcribe.model.StartTranscriptionJobRequest;
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobRequest;
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobResponse;
-import ws.schild.jave.Encoder;
-import ws.schild.jave.MultimediaObject;
-import ws.schild.jave.encode.AudioAttributes;
-import ws.schild.jave.encode.EncodingAttributes;
 
 import java.io.File;
 import java.io.IOException;
@@ -43,8 +39,12 @@ import java.util.Properties;
 
 public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
 
+    // Updated HttpClient that follows redirects.
+    private static final HttpClient httpClient = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
+
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final HttpClient httpClient = HttpClient.newHttpClient();
     private static String cachedOpenAiApiKey = null; // API key cache
 
     @Override
@@ -74,6 +74,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         .withBody("<Response><Message>" + escapeXml(versionInfo) + "</Message></Response>");
             }
 
+            // Audio processing branch:
             if (mediaUrl != null && !mediaUrl.isEmpty()) {
                 StringBuilder debugLog = new StringBuilder();
                 boolean errorOccurred = false;
@@ -109,17 +110,15 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         }
                     }
 
-                    // Step 3: Convert OGG to MP3.
-                    Path tempMp3File = null;
+                    // Step 3: Upload OGG file to S3.
+                    String s3Uri = null;
                     if (tempOggFile != null) {
                         try {
-                            debugLog.append("Step 3: Converting OGG to MP3...\n");
-                            tempMp3File = convertOggToMp3(tempOggFile, context);
-                            debugLog.append("Conversion complete. MP3 file at ")
-                                    .append(tempMp3File.toString())
-                                    .append(" (").append(Files.size(tempMp3File)).append(" bytes).\n");
+                            debugLog.append("Step 3: Uploading OGG file to S3...\n");
+                            s3Uri = uploadAudioToS3(tempOggFile, context);
+                            debugLog.append("Uploaded to S3. S3 URI: ").append(s3Uri).append("\n");
                         } catch (Exception e) {
-                            debugLog.append("Error converting to MP3: ").append(e.getMessage()).append("\n")
+                            debugLog.append("Error uploading OGG file: ").append(e.getMessage()).append("\n")
                                     .append(getStackTrace(e)).append("\n");
                             errorOccurred = true;
                         } finally {
@@ -133,32 +132,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         }
                     }
 
-                    // Step 4: Upload MP3 to S3.
-                    String s3Uri = null;
-                    if (tempMp3File != null) {
-                        try {
-                            debugLog.append("Step 4: Uploading MP3 to S3...\n");
-                            s3Uri = uploadAudioToS3(tempMp3File, context);
-                            debugLog.append("Uploaded to S3. S3 URI: ").append(s3Uri).append("\n");
-                        } catch (Exception e) {
-                            debugLog.append("Error uploading MP3: ").append(e.getMessage()).append("\n")
-                                    .append(getStackTrace(e)).append("\n");
-                            errorOccurred = true;
-                        } finally {
-                            try {
-                                Files.deleteIfExists(tempMp3File);
-                                debugLog.append("Temporary MP3 file deleted.\n");
-                            } catch (Exception e) {
-                                debugLog.append("Error deleting MP3 file: ").append(e.getMessage()).append("\n")
-                                        .append(getStackTrace(e)).append("\n");
-                            }
-                        }
-                    }
-
-                    // Step 5: Transcribe.
+                    // Step 4: Start transcription job using OGG format.
                     if (s3Uri != null) {
                         try {
-                            debugLog.append("Step 5: Starting transcription job...\n");
+                            debugLog.append("Step 4: Starting transcription job...\n");
                             String transcript = transcribeAudio(s3Uri, context);
                             debugLog.append("Transcription complete. Transcript: ").append(transcript).append("\n");
                         } catch (Exception e) {
@@ -237,7 +214,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return map;
     }
 
-    // Retrieve Twilio credentials from AWS Secrets Manager.
+    // Retrieve Twilio credentials from Secrets Manager using secret name "Twilio".
     private Map<String, String> getTwilioCredentials(Context context) {
         String secretName = "Twilio";
         Region region = Region.of("eu-west-1");
@@ -250,8 +227,13 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
             String secret = response.secretString();
             JsonNode jsonNode = objectMapper.readTree(secret);
             Map<String, String> credentials = new HashMap<>();
-            credentials.put("accountSid", jsonNode.get("TWILIO_ACCOUNT_SID").asText());
-            credentials.put("authToken", jsonNode.get("TWILIO_AUTH_TOKEN").asText());
+            JsonNode sidNode = jsonNode.get("TWILIO_ACCOUNT_SID");
+            JsonNode tokenNode = jsonNode.get("TWILIO_AUTH_TOKEN");
+            if (sidNode == null || tokenNode == null) {
+                throw new RuntimeException("Twilio secret is missing required keys.");
+            }
+            credentials.put("TWILIO_ACCOUNT_SID", sidNode.asText());
+            credentials.put("TWILIO_AUTH_TOKEN", tokenNode.asText());
             return credentials;
         } catch (Exception e) {
             context.getLogger().log("Error retrieving Twilio credentials: " + e.getMessage());
@@ -261,12 +243,13 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         }
     }
 
+    // downloadAudio uses Basic auth with credentials from Secrets Manager.
     private byte[] downloadAudio(String mediaUrl, Context context, StringBuilder debugLog) throws IOException, InterruptedException {
         Map<String, String> creds = getTwilioCredentials(context);
-        if (creds == null || !creds.containsKey("accountSid") || !creds.containsKey("authToken")) {
+        if (creds == null || !creds.containsKey("TWILIO_ACCOUNT_SID") || !creds.containsKey("TWILIO_AUTH_TOKEN")) {
             throw new IOException("Twilio credentials not available.");
         }
-        String credentials = creds.get("accountSid") + ":" + creds.get("authToken");
+        String credentials = creds.get("TWILIO_ACCOUNT_SID") + ":" + creds.get("TWILIO_AUTH_TOKEN");
         String encodedCredentials = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(mediaUrl))
@@ -279,9 +262,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return response.body();
     }
 
+    // Uploads the OGG file to S3.
     private String uploadAudioToS3(Path audioFilePath, Context context) throws IOException {
         String bucketName = "twilio-audio-messages-eu-west-1-andreslandaaws";
-        String key = "transcribe/" + System.currentTimeMillis() + ".mp3";
+        String key = "transcribe/" + System.currentTimeMillis() + ".ogg";
         context.getLogger().log("uploadAudioToS3: Uploading file " + audioFilePath.toString()
                 + " of size " + Files.size(audioFilePath) + " bytes");
         try (S3Client s3 = S3Client.builder().region(Region.of("eu-west-1")).build()){
@@ -294,33 +278,14 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return "s3://" + bucketName + "/" + key;
     }
 
-    private Path convertOggToMp3(Path sourceOgg, Context context) throws Exception {
-        Path targetMp3 = Files.createTempFile("audio-converted", ".mp3");
-        File sourceFile = sourceOgg.toFile();
-        File targetFile = targetMp3.toFile();
-
-        AudioAttributes audio = new AudioAttributes();
-        audio.setCodec("libmp3lame");
-        audio.setBitRate(128000);
-        audio.setChannels(2);
-        audio.setSamplingRate(44100);
-
-        EncodingAttributes attrs = new EncodingAttributes();
-        attrs.setAudioAttributes(audio);
-
-        Encoder encoder = new Encoder();
-        encoder.encode(new MultimediaObject(sourceFile), targetFile, attrs);
-        context.getLogger().log("Converted audio file to MP3. Output file: " + targetMp3 + ", size: " + Files.size(targetMp3));
-        return targetMp3;
-    }
-
+    // Transcribe the OGG file using AWS Transcribe (media format "ogg").
     private String transcribeAudio(String s3Uri, Context context) throws InterruptedException, IOException {
         try (TranscribeClient transcribeClient = TranscribeClient.builder().region(Region.of("eu-west-1")).build()){
             String jobName = "TranscriptionJob-" + System.currentTimeMillis();
             StartTranscriptionJobRequest startRequest = StartTranscriptionJobRequest.builder()
                     .transcriptionJobName(jobName)
                     .languageCode("en-US")
-                    .mediaFormat("mp3")
+                    .mediaFormat("ogg")
                     .media(Media.builder().mediaFileUri(s3Uri).build())
                     .build();
             transcribeClient.startTranscriptionJob(startRequest);
