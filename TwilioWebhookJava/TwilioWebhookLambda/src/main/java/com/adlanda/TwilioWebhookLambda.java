@@ -18,7 +18,6 @@ import software.amazon.awssdk.services.transcribe.model.StartTranscriptionJobReq
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobRequest;
 import software.amazon.awssdk.services.transcribe.model.GetTranscriptionJobResponse;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -78,6 +77,8 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
             if (mediaUrl != null && !mediaUrl.isEmpty()) {
                 StringBuilder debugLog = new StringBuilder();
                 boolean errorOccurred = false;
+                String chatGptResponse = ""; // store ChatGPT response here
+
                 try {
                     debugLog.append("Media URL: ").append(mediaUrl).append("\n");
 
@@ -132,12 +133,21 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         }
                     }
 
-                    // Step 4: Start transcription job using OGG format.
+                    // Step 4: Start transcription job using OGG format and call ChatGPT with the transcript.
                     if (s3Uri != null) {
                         try {
                             debugLog.append("Step 4: Starting transcription job...\n");
                             String transcript = transcribeAudio(s3Uri, context);
                             debugLog.append("Transcription complete. Transcript: ").append(transcript).append("\n");
+
+                            // Call ChatGPT API with the transcript.
+                            String openAiApiKey = getOpenAiApiKey(context);
+                            if (openAiApiKey == null || openAiApiKey.isEmpty()) {
+                                debugLog.append("Error: OpenAI API key unavailable.\n");
+                            } else {
+                                chatGptResponse = callChatGpt(transcript, openAiApiKey, context);
+                                debugLog.append("ChatGPT response: ").append(chatGptResponse).append("\n");
+                            }
                         } catch (Exception e) {
                             debugLog.append("Error transcribing audio: ").append(e.getMessage()).append("\n")
                                     .append(getStackTrace(e)).append("\n");
@@ -154,7 +164,8 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                 if (errorOccurred) {
                     responseBody = "<Response><Message>Error processing audio file</Message></Response>";
                 } else {
-                    responseBody = "<Response><Message>" + escapeXml(debugLog.toString()) + "</Message></Response>";
+                    // Instead of returning the full debug log, return only the ChatGPT response.
+                    responseBody = "<Response><Message>" + escapeXml(chatGptResponse) + "</Message></Response>";
                 }
                 return new APIGatewayProxyResponseEvent()
                         .withStatusCode(200)
