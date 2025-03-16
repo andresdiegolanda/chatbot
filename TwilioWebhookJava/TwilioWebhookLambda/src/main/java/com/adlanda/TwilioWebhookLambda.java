@@ -38,13 +38,22 @@ import java.util.Properties;
 
 public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
 
-    // Updated HttpClient that follows redirects.
+    // Static initialization of clients
     private static final HttpClient httpClient = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
-
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private static String cachedOpenAiApiKey = null; // API key cache
+    private static final Region REGION = Region.of("eu-west-1");
+    private static final SecretsManagerClient secretsManagerClient = SecretsManagerClient.builder()
+            .region(REGION)
+            .build();
+    private static final S3Client s3Client = S3Client.builder()
+            .region(REGION)
+            .build();
+    private static final TranscribeClient transcribeClient = TranscribeClient.builder()
+            .region(REGION)
+            .build();
 
     @Override
     public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent event, Context context) {
@@ -77,7 +86,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
             if (mediaUrl != null && !mediaUrl.isEmpty()) {
                 StringBuilder debugLog = new StringBuilder();
                 boolean errorOccurred = false;
-                String chatGptResponse = ""; // store ChatGPT response here
+                String chatGptResponse = "";
 
                 try {
                     debugLog.append("Media URL: ").append(mediaUrl).append("\n");
@@ -133,7 +142,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                         }
                     }
 
-                    // Step 4: Start transcription job using OGG format and call ChatGPT with the transcript.
+                    // Step 4: Start transcription job and call ChatGPT with the transcript.
                     if (s3Uri != null) {
                         try {
                             debugLog.append("Step 4: Starting transcription job...\n");
@@ -164,7 +173,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
                 if (errorOccurred) {
                     responseBody = "<Response><Message>Error processing audio file</Message></Response>";
                 } else {
-                    // Instead of returning the full debug log, return only the ChatGPT response.
+                    // Return only the ChatGPT response.
                     responseBody = "<Response><Message>" + escapeXml(chatGptResponse) + "</Message></Response>";
                 }
                 return new APIGatewayProxyResponseEvent()
@@ -225,16 +234,14 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return map;
     }
 
-    // Retrieve Twilio credentials from Secrets Manager using secret name "Twilio".
+    // Retrieve Twilio credentials using the static Secrets Manager client.
     private Map<String, String> getTwilioCredentials(Context context) {
         String secretName = "Twilio";
-        Region region = Region.of("eu-west-1");
-        SecretsManagerClient client = SecretsManagerClient.builder().region(region).build();
         try {
             GetSecretValueRequest request = GetSecretValueRequest.builder()
                     .secretId(secretName)
                     .build();
-            GetSecretValueResponse response = client.getSecretValue(request);
+            GetSecretValueResponse response = secretsManagerClient.getSecretValue(request);
             String secret = response.secretString();
             JsonNode jsonNode = objectMapper.readTree(secret);
             Map<String, String> credentials = new HashMap<>();
@@ -249,12 +256,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         } catch (Exception e) {
             context.getLogger().log("Error retrieving Twilio credentials: " + e.getMessage());
             return null;
-        } finally {
-            client.close();
         }
     }
 
-    // downloadAudio uses Basic auth with credentials from Secrets Manager.
+    // Download audio using Basic auth with credentials from Secrets Manager.
     private byte[] downloadAudio(String mediaUrl, Context context, StringBuilder debugLog) throws IOException, InterruptedException {
         Map<String, String> creds = getTwilioCredentials(context);
         if (creds == null || !creds.containsKey("TWILIO_ACCOUNT_SID") || !creds.containsKey("TWILIO_AUTH_TOKEN")) {
@@ -273,81 +278,73 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         return response.body();
     }
 
-    // Uploads the OGG file to S3.
+    // Uploads the OGG file to S3 using the static S3 client.
     private String uploadAudioToS3(Path audioFilePath, Context context) throws IOException {
         String bucketName = "twilio-audio-messages-eu-west-1-andreslandaaws";
         String key = "transcribe/" + System.currentTimeMillis() + ".ogg";
         context.getLogger().log("uploadAudioToS3: Uploading file " + audioFilePath.toString()
                 + " of size " + Files.size(audioFilePath) + " bytes");
-        try (S3Client s3 = S3Client.builder().region(Region.of("eu-west-1")).build()){
-            PutObjectRequest putReq = PutObjectRequest.builder()
-                    .bucket(bucketName)
-                    .key(key)
-                    .build();
-            s3.putObject(putReq, audioFilePath);
-        }
+        PutObjectRequest putReq = PutObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build();
+        s3Client.putObject(putReq, audioFilePath);
         return "s3://" + bucketName + "/" + key;
     }
 
-    // Transcribe the OGG file using AWS Transcribe (media format "ogg").
+    // Transcribe the OGG file using AWS Transcribe with the static Transcribe client.
     private String transcribeAudio(String s3Uri, Context context) throws InterruptedException, IOException {
-        try (TranscribeClient transcribeClient = TranscribeClient.builder().region(Region.of("eu-west-1")).build()){
-            String jobName = "TranscriptionJob-" + System.currentTimeMillis();
-            StartTranscriptionJobRequest startRequest = StartTranscriptionJobRequest.builder()
-                    .transcriptionJobName(jobName)
-                    .languageCode("en-US")
-                    .mediaFormat("ogg")
-                    .media(Media.builder().mediaFileUri(s3Uri).build())
-                    .build();
-            transcribeClient.startTranscriptionJob(startRequest);
+        String jobName = "TranscriptionJob-" + System.currentTimeMillis();
+        StartTranscriptionJobRequest startRequest = StartTranscriptionJobRequest.builder()
+                .transcriptionJobName(jobName)
+                .languageCode("en-US")
+                .mediaFormat("ogg")
+                .media(Media.builder().mediaFileUri(s3Uri).build())
+                .build();
+        transcribeClient.startTranscriptionJob(startRequest);
 
-            String jobStatus = "";
-            int attempts = 0;
-            while (attempts < 30) {
-                GetTranscriptionJobRequest getRequest = GetTranscriptionJobRequest.builder()
-                        .transcriptionJobName(jobName)
-                        .build();
-                GetTranscriptionJobResponse getResponse = transcribeClient.getTranscriptionJob(getRequest);
-                jobStatus = getResponse.transcriptionJob().transcriptionJobStatusAsString();
-                context.getLogger().log("transcribeAudio: Poll attempt " + (attempts + 1) + ", status: " + jobStatus);
-                if ("COMPLETED".equals(jobStatus)) {
-                    break;
-                } else if ("FAILED".equals(jobStatus)) {
-                    throw new RuntimeException("Transcription job failed: " + getResponse.transcriptionJob().failureReason());
-                }
-                Thread.sleep(10000);
-                attempts++;
-            }
-            if (!"COMPLETED".equals(jobStatus)) {
-                throw new RuntimeException("Transcription job timed out.");
-            }
-            GetTranscriptionJobResponse finalResponse = transcribeClient.getTranscriptionJob(
-                    GetTranscriptionJobRequest.builder().transcriptionJobName(jobName).build());
-            String transcriptFileUri = finalResponse.transcriptionJob().transcript().transcriptFileUri();
-            context.getLogger().log("transcribeAudio: Transcript file URI: " + transcriptFileUri);
-            HttpRequest transcriptRequest = HttpRequest.newBuilder()
-                    .uri(URI.create(transcriptFileUri))
+        String jobStatus = "";
+        int attempts = 0;
+        while (attempts < 30) {
+            GetTranscriptionJobRequest getRequest = GetTranscriptionJobRequest.builder()
+                    .transcriptionJobName(jobName)
                     .build();
-            HttpResponse<String> transcriptResponse = httpClient.send(transcriptRequest, HttpResponse.BodyHandlers.ofString());
-            JsonNode transcriptJson = objectMapper.readTree(transcriptResponse.body());
-            String transcriptText = transcriptJson.get("results").get("transcripts").get(0).get("transcript").asText();
-            return transcriptText;
+            GetTranscriptionJobResponse getResponse = transcribeClient.getTranscriptionJob(getRequest);
+            jobStatus = getResponse.transcriptionJob().transcriptionJobStatusAsString();
+            context.getLogger().log("transcribeAudio: Poll attempt " + (attempts + 1) + ", status: " + jobStatus);
+            if ("COMPLETED".equals(jobStatus)) {
+                break;
+            } else if ("FAILED".equals(jobStatus)) {
+                throw new RuntimeException("Transcription job failed: " + getResponse.transcriptionJob().failureReason());
+            }
+            Thread.sleep(10000);
+            attempts++;
         }
+        if (!"COMPLETED".equals(jobStatus)) {
+            throw new RuntimeException("Transcription job timed out.");
+        }
+        GetTranscriptionJobResponse finalResponse = transcribeClient.getTranscriptionJob(
+                GetTranscriptionJobRequest.builder().transcriptionJobName(jobName).build());
+        String transcriptFileUri = finalResponse.transcriptionJob().transcript().transcriptFileUri();
+        context.getLogger().log("transcribeAudio: Transcript file URI: " + transcriptFileUri);
+        HttpRequest transcriptRequest = HttpRequest.newBuilder()
+                .uri(URI.create(transcriptFileUri))
+                .build();
+        HttpResponse<String> transcriptResponse = httpClient.send(transcriptRequest, HttpResponse.BodyHandlers.ofString());
+        JsonNode transcriptJson = objectMapper.readTree(transcriptResponse.body());
+        String transcriptText = transcriptJson.get("results").get("transcripts").get(0).get("transcript").asText();
+        return transcriptText;
     }
 
     public String getOpenAiApiKey(Context context) {
         if (cachedOpenAiApiKey != null) return cachedOpenAiApiKey;
         String secretName = "OpenAiApiKey";
-        Region region = Region.of("eu-west-1");
 
-        SecretsManagerClient client = SecretsManagerClient.builder()
-                .region(region)
-                .build();
-        GetSecretValueRequest request = GetSecretValueRequest.builder()
-                .secretId(secretName)
-                .build();
         try {
-            GetSecretValueResponse response = client.getSecretValue(request);
+            GetSecretValueRequest request = GetSecretValueRequest.builder()
+                    .secretId(secretName)
+                    .build();
+            GetSecretValueResponse response = secretsManagerClient.getSecretValue(request);
             String secret = response.secretString();
             if (secret.trim().startsWith("{")) {
                 JsonNode jsonNode = objectMapper.readTree(secret);
@@ -361,12 +358,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
         } catch (Exception e) {
             context.getLogger().log("Error retrieving secret " + secretName + ": " + e.getMessage());
             return null;
-        } finally {
-            client.close();
         }
     }
 
-    private String callChatGpt(String prompt, String apiKey, Context context) {
+    protected String callChatGpt(String prompt, String apiKey, Context context) {
         if (prompt == null || prompt.isEmpty()) {
             context.getLogger().log("callChatGpt: Prompt is empty.");
             return "No prompt provided.";
