@@ -48,6 +48,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 	private static final String OPEN_AI_SECRET_NAME = "OpenAiApiKey";
 	private static final String TWILIO_ACCOUNT_SID_KEY = "TWILIO_ACCOUNT_SID";
 	private static final String TWILIO_AUTH_TOKEN_KEY = "TWILIO_AUTH_TOKEN";
+	private static final String JSON_TRANSCRIPT = "transcript";
 	private static final String JSON_CONTENT = "content";
 
 	// Static initialization of clients with explicit credentials provider.
@@ -334,7 +335,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 		if (!transcriptsNode.isArray() || transcriptsNode.size() == 0) {
 			throw new IOException("Transcript JSON structure is invalid.");
 		}
-		return transcriptsNode.get(0).path(JSON_CONTENT).asText();
+		return transcriptsNode.get(0).path(JSON_TRANSCRIPT).asText();
 	}
 
 	public static String getOpenAiApiKey(Context context) {
