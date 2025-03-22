@@ -12,12 +12,15 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
@@ -55,10 +58,10 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL)
 			.build();
 	private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-	// Volatile to ensure thread safety.
-	private static volatile String cachedOpenAiApiKey = null;
+	// Atomic caching for OpenAI API key.
+	private static final AtomicReference<String> cachedOpenAiApiKey = new AtomicReference<>(null);
 	private static final Region REGION = Region.of("eu-west-1");
-	private static final SecretsManagerClient SECRETS_MANAGER_CLIENT = SecretsManagerClient.builder().region(REGION)
+	static final SecretsManagerClient SECRETS_MANAGER_CLIENT = SecretsManagerClient.builder().region(REGION)
 			.credentialsProvider(DefaultCredentialsProvider.create()).build();
 	private static final S3Client S3_CLIENT = S3Client.builder().region(REGION)
 			.credentialsProvider(DefaultCredentialsProvider.create()).build();
@@ -79,10 +82,13 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 
 		try {
 			String rawBody = event.getBody();
+			if (rawBody == null) {
+				rawBody = "";
+			}
 			if (Boolean.TRUE.equals(event.getIsBase64Encoded())) {
 				rawBody = new String(Base64.getDecoder().decode(rawBody), StandardCharsets.UTF_8);
 			}
-			context.getLogger().log("Raw body: " + rawBody);
+			logStructured(context, "rawBody", Map.of("body", rawBody));
 
 			Map<String, String> params = parseFormData(rawBody);
 			String messageBody = params.getOrDefault("Body", "").trim();
@@ -101,7 +107,8 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 			// Non-audio (text) branch.
 			return processTextMessage(messageBody, context, responseHeaders);
 		} catch (Exception e) {
-			context.getLogger().log("Unhandled exception in handleRequest: " + e.getMessage());
+			logStructured(context, "error", Map.of("message", "Unhandled exception in handleRequest", "error",
+					e.getMessage() == null ? "null" : e.getMessage()));
 			StringWriter sw = new StringWriter();
 			e.printStackTrace(new PrintWriter(sw));
 			String errorResponse = XML_RESPONSE_START
@@ -116,19 +123,19 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 
 	private APIGatewayProxyResponseEvent processTextMessage(String messageBody, Context context,
 			Map<String, String> responseHeaders) {
-		context.getLogger().log("Final text to process: " + messageBody);
+		logStructured(context, "processTextMessage", Map.of("finalText", messageBody));
 		String openAiApiKey = getOpenAiApiKey(context);
 		if (openAiApiKey == null || openAiApiKey.isEmpty()) {
-			context.getLogger().log("Failed to retrieve OpenAI API key.");
+			logStructured(context, "error", Map.of("message", "Failed to retrieve OpenAI API key"));
 			String errBody = XML_RESPONSE_START + escapeXml("Error: API key unavailable.") + XML_RESPONSE_END;
 			return createResponse(500, errBody, responseHeaders);
 		}
 		String chatGptResponse = callChatGpt(messageBody, openAiApiKey, context);
 		if (chatGptResponse == null || chatGptResponse.trim().isEmpty()) {
 			chatGptResponse = "No response from ChatGPT.";
-			context.getLogger().log("ChatGPT returned an empty response. Using fallback message.");
+			logStructured(context, "fallback", Map.of("message", "ChatGPT returned an empty response."));
 		}
-		context.getLogger().log("ChatGPT response: " + chatGptResponse);
+		logStructured(context, "chatGptResponse", Map.of("response", chatGptResponse));
 		String twimlResponse = XML_RESPONSE_START + escapeXml(chatGptResponse) + XML_RESPONSE_END;
 		return createResponse(200, twimlResponse, responseHeaders);
 	}
@@ -139,46 +146,54 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 	private APIGatewayProxyResponseEvent processAudioMessage(String mediaUrl, Context context,
 			Map<String, String> responseHeaders) {
 		StringBuilder debugLog = new StringBuilder();
+		debugLog.append("Starting audio processing.\n");
 
 		// Download audio safely.
 		byte[] audioData = safeDownloadAudio(mediaUrl, context, debugLog);
 		if (audioData.length == 0) {
-			return createResponse(200, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
+			return createResponse(500, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
 		}
 
-		// Create temporary OGG file safely.
+		// Create temporary OGG file safely with explicit temp directory.
 		Path tempOggFile = safeCreateTempOggFile(audioData, debugLog);
 		if (tempOggFile == null) {
-			return createResponse(200, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
+			return createResponse(500, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
 		}
 
-		// Upload file safely.
-		String s3Uri = safeUploadFile(tempOggFile, context, debugLog);
+		String s3Uri = null;
 		try {
-			Files.deleteIfExists(tempOggFile);
-			debugLog.append("Temporary OGG file deleted.\n");
-		} catch (IOException ioe) {
-			debugLog.append("Error deleting OGG file: ").append(ioe.getMessage()).append("\n")
-					.append(getStackTrace(ioe)).append("\n");
-		}
-		if (s3Uri == null) {
-			return createResponse(200, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
-		}
-
-		// Get ChatGPT response from transcription.
-		String chatGptResponse;
-		try {
-			chatGptResponse = getChatGptResponseForS3Uri(s3Uri, context, debugLog);
-		} catch (IOException | InterruptedException ex) {
-			if (ex instanceof InterruptedException) {
-				Thread.currentThread().interrupt();
+			// Upload file safely.
+			debugLog.append("Step 3: Uploading OGG file to S3...\n");
+			s3Uri = safeUploadFile(tempOggFile, context, debugLog);
+			debugLog.append("Uploaded to S3. S3 URI: ").append(s3Uri).append("\n");
+			if (s3Uri == null) {
+				return createResponse(500, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
 			}
-			debugLog.append("Error processing transcription: ").append(ex.getMessage()).append("\n")
-					.append(getStackTrace(ex)).append("\n");
-			return createResponse(200, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
+			// Get ChatGPT response from transcription.
+			String chatGptResponse;
+			try {
+				chatGptResponse = getChatGptResponseForS3Uri(s3Uri, context, debugLog);
+			} catch (IOException | InterruptedException ex) {
+				if (ex instanceof InterruptedException) {
+					Thread.currentThread().interrupt();
+				}
+				debugLog.append("Error processing transcription: ").append(ex.getMessage()).append("\n")
+						.append(getStackTrace(ex)).append("\n");
+				return createResponse(500, XML_RESPONSE_START + AUDIO_ERROR_MSG + XML_RESPONSE_END, responseHeaders);
+			}
+			logStructured(context, "audioProcessing",
+					Map.of("chatGptResponse", chatGptResponse, "debugLog", debugLog.toString()));
+			return createResponse(200, XML_RESPONSE_START + escapeXml(chatGptResponse) + XML_RESPONSE_END,
+					responseHeaders);
+		} finally {
+			try {
+				Files.deleteIfExists(tempOggFile);
+				debugLog.append("Temporary OGG file deleted.\n");
+			} catch (IOException ioe) {
+				debugLog.append("Error deleting OGG file: ").append(ioe.getMessage()).append("\n")
+						.append(getStackTrace(ioe)).append("\n");
+			}
 		}
-		context.getLogger().log("Final debug log: " + debugLog.toString());
-		return createResponse(200, XML_RESPONSE_START + escapeXml(chatGptResponse) + XML_RESPONSE_END, responseHeaders);
 	}
 
 	// Helper method: safely download audio.
@@ -212,10 +227,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 	// Helper method: safely upload file.
 	private String safeUploadFile(Path file, Context context, StringBuilder debugLog) {
 		try {
-			debugLog.append("Step 3: Uploading OGG file to S3...\n");
-			String s3Uri = uploadAudioToS3(file, context);
-			debugLog.append("Uploaded to S3. S3 URI: ").append(s3Uri).append("\n");
-			return s3Uri;
+			return uploadAudioToS3(file, context);
 		} catch (IOException e) {
 			debugLog.append("Error uploading OGG file: ").append(e.getMessage()).append("\n").append(getStackTrace(e))
 					.append("\n");
@@ -240,14 +252,15 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 
 	// Helper method to create a temporary OGG file.
 	private Path createTempOggFile(byte[] audioData, StringBuilder debugLog) throws IOException {
-		Path tempOggFile = Files.createTempFile("audio", ".ogg");
+		Path tempDir = Paths.get(System.getProperty("java.io.tmpdir"));
+		Path tempOggFile = Files.createTempFile(tempDir, "audio-", ".ogg");
 		Files.write(tempOggFile, audioData, StandardOpenOption.WRITE);
 		debugLog.append("Temporary OGG file created at ").append(tempOggFile.toString()).append(" (")
 				.append(Files.size(tempOggFile)).append(" bytes).\n");
 		return tempOggFile;
 	}
 
-	private Map<String, String> parseFormData(String data) {
+	Map<String, String> parseFormData(String data) {
 		Map<String, String> map = new HashMap<>();
 		if (data == null || data.isEmpty()) {
 			return map;
@@ -264,7 +277,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 		return map;
 	}
 
-	private byte[] downloadAudio(String mediaUrl, Context context, StringBuilder debugLog)
+	byte[] downloadAudio(String mediaUrl, Context context, StringBuilder debugLog)
 			throws IOException, InterruptedException {
 		Map<String, String> creds = getTwilioCredentials(context);
 		if (creds.isEmpty() || !creds.containsKey(TWILIO_ACCOUNT_SID_KEY)
@@ -278,22 +291,25 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 		HttpResponse<byte[]> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofByteArray());
 		debugLog.append("Twilio Response Code: ").append(response.statusCode()).append("\n");
 		debugLog.append("Twilio Response Headers: ").append(response.headers().map().toString()).append("\n");
-		context.getLogger().log("downloadAudio: Received audio data of length: " + response.body().length);
+		logStructured(context, "downloadAudio",
+				Map.of("responseCode", response.statusCode(), "dataLength", response.body().length));
 		return response.body();
 	}
 
-	private String uploadAudioToS3(Path audioFilePath, Context context) throws IOException {
+	String uploadAudioToS3(Path audioFilePath, Context context) throws IOException {
+		// TODO: Monitor AWS service limits for S3 usage.
 		final String bucketName = "twilio-audio-messages-eu-west-1-andreslandaaws";
-		final String key = "transcribe/" + System.currentTimeMillis() + ".ogg";
-		context.getLogger().log("uploadAudioToS3: Uploading file " + audioFilePath.toString() + " of size "
-				+ Files.size(audioFilePath) + " bytes");
+		final String key = "transcribe/" + UUID.randomUUID().toString() + ".ogg";
+		logStructured(context, "uploadAudioToS3",
+				Map.of("filePath", audioFilePath.toString(), "fileSize", Files.size(audioFilePath), "s3Key", key));
 		PutObjectRequest putReq = PutObjectRequest.builder().bucket(bucketName).key(key).build();
 		S3_CLIENT.putObject(putReq, audioFilePath);
 		return "s3://" + bucketName + "/" + key;
 	}
 
-	private String transcribeAudio(String s3Uri, Context context) throws IOException, InterruptedException {
-		String jobName = "TranscriptionJob-" + System.currentTimeMillis();
+	String transcribeAudio(String s3Uri, Context context) throws IOException, InterruptedException {
+		// Use UUID for unique transcription job name.
+		String jobName = "TranscriptionJob-" + UUID.randomUUID().toString();
 		StartTranscriptionJobRequest startRequest = StartTranscriptionJobRequest.builder().transcriptionJobName(jobName)
 				.languageCode("en-US").mediaFormat("ogg").media(mediaBuilder -> mediaBuilder.mediaFileUri(s3Uri))
 				.build();
@@ -306,7 +322,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 					.build();
 			GetTranscriptionJobResponse getResponse = TRANSCRIBE_CLIENT.getTranscriptionJob(getRequest);
 			jobStatus = getResponse.transcriptionJob().transcriptionJobStatusAsString();
-			context.getLogger().log("transcribeAudio: Poll attempt " + (attempts + 1) + ", status: " + jobStatus);
+			logStructured(context, "transcribeAudio", Map.of("attempt", attempts + 1, "status", jobStatus));
 			if ("COMPLETED".equals(jobStatus)) {
 				break;
 			} else if ("FAILED".equals(jobStatus)) {
@@ -326,7 +342,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 		GetTranscriptionJobResponse finalResponse = TRANSCRIBE_CLIENT
 				.getTranscriptionJob(GetTranscriptionJobRequest.builder().transcriptionJobName(jobName).build());
 		String transcriptFileUri = finalResponse.transcriptionJob().transcript().transcriptFileUri();
-		context.getLogger().log("transcribeAudio: Transcript file URI: " + transcriptFileUri);
+		logStructured(context, "transcribeAudio", Map.of("transcriptFileUri", transcriptFileUri));
 		HttpRequest transcriptRequest = HttpRequest.newBuilder().uri(URI.create(transcriptFileUri)).build();
 		HttpResponse<String> transcriptResponse = HTTP_CLIENT.send(transcriptRequest,
 				HttpResponse.BodyHandlers.ofString());
@@ -339,8 +355,9 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 	}
 
 	public static String getOpenAiApiKey(Context context) {
-		if (cachedOpenAiApiKey != null) {
-			return cachedOpenAiApiKey;
+		String key = cachedOpenAiApiKey.get();
+		if (key != null) {
+			return key;
 		}
 		try {
 			GetSecretValueRequest request = GetSecretValueRequest.builder().secretId(OPEN_AI_SECRET_NAME).build();
@@ -349,21 +366,23 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 			if (secret != null && secret.trim().startsWith("{")) {
 				JsonNode jsonNode = OBJECT_MAPPER.readTree(secret);
 				if (jsonNode.has(OPEN_AI_SECRET_NAME)) {
-					cachedOpenAiApiKey = jsonNode.get(OPEN_AI_SECRET_NAME).asText();
-					return cachedOpenAiApiKey;
+					key = jsonNode.get(OPEN_AI_SECRET_NAME).asText();
+					cachedOpenAiApiKey.compareAndSet(null, key);
+					return key;
 				}
 			}
-			cachedOpenAiApiKey = secret;
-			return cachedOpenAiApiKey;
+			cachedOpenAiApiKey.compareAndSet(null, secret);
+			return secret;
 		} catch (Exception e) {
-			context.getLogger().log("Error retrieving secret " + OPEN_AI_SECRET_NAME + ": " + e.getMessage());
+			logStaticError(context, "Error retrieving secret " + OPEN_AI_SECRET_NAME + ": "
+					+ (e.getMessage() == null ? "null" : e.getMessage()));
 			return null;
 		}
 	}
 
 	protected String callChatGpt(String prompt, String apiKey, Context context) {
 		if (prompt == null || prompt.isEmpty()) {
-			context.getLogger().log("callChatGpt: Prompt is empty.");
+			logStructured(context, "callChatGpt", Map.of("message", "Prompt is empty."));
 			return "No prompt provided.";
 		}
 		try {
@@ -371,13 +390,13 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 					new Object[] { Map.of("role", "system", JSON_CONTENT, "You are ChatGPT."),
 							Map.of("role", "user", JSON_CONTENT, prompt) },
 					"temperature", 0.7));
-			context.getLogger().log("ChatGPT Request: " + requestBody);
+			logStructured(context, "callChatGpt", Map.of("requestBody", requestBody));
 			HttpRequest request = HttpRequest.newBuilder().uri(URI.create("https://api.openai.com/v1/chat/completions"))
 					.header("Content-Type", "application/json").header("Authorization", "Bearer " + apiKey)
 					.POST(HttpRequest.BodyPublishers.ofString(requestBody)).build();
 			HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-			context.getLogger().log("ChatGPT Response Code: " + response.statusCode());
-			context.getLogger().log("ChatGPT Response Body: " + response.body());
+			logStructured(context, "callChatGpt",
+					Map.of("responseCode", response.statusCode(), "responseBody", response.body()));
 			JsonNode jsonNode = OBJECT_MAPPER.readTree(response.body());
 			JsonNode choicesNode = jsonNode.get("choices");
 			if (choicesNode != null && choicesNode.isArray() && choicesNode.size() > 0) {
@@ -389,8 +408,9 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 			if (e instanceof InterruptedException) {
 				Thread.currentThread().interrupt();
 			}
-			context.getLogger().log("Error calling ChatGPT API: " + e.getMessage());
-			return "Error calling ChatGPT API: " + e.getMessage() + "\n" + getStackTrace(e);
+			logStructured(context, "callChatGpt", Map.of("error", e.getMessage() == null ? "null" : e.getMessage()));
+			return "Error calling ChatGPT API: " + (e.getMessage() == null ? "null" : e.getMessage()) + "\n"
+					+ getStackTrace(e);
 		}
 	}
 
@@ -425,7 +445,7 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 				"&apos;");
 	}
 
-	private Map<String, String> getTwilioCredentials(Context context) {
+	Map<String, String> getTwilioCredentials(Context context) {
 		final String secretName = "Twilio";
 		try {
 			GetSecretValueRequest request = GetSecretValueRequest.builder().secretId(secretName).build();
@@ -436,15 +456,34 @@ public class TwilioWebhookLambda implements RequestHandler<APIGatewayProxyReques
 			JsonNode sidNode = jsonNode.get(TWILIO_ACCOUNT_SID_KEY);
 			JsonNode tokenNode = jsonNode.get(TWILIO_AUTH_TOKEN_KEY);
 			if (sidNode == null || tokenNode == null) {
-				context.getLogger().log("Twilio secret is missing required keys.");
+				logStructured(context, "error", Map.of("message", "Twilio secret is missing required keys."));
 				return Collections.emptyMap();
 			}
 			credentials.put(TWILIO_ACCOUNT_SID_KEY, sidNode.asText());
 			credentials.put(TWILIO_AUTH_TOKEN_KEY, tokenNode.asText());
 			return credentials;
 		} catch (Exception e) {
-			context.getLogger().log("Error retrieving Twilio credentials: " + e.getMessage());
+			logStructured(context, "error", Map.of("message", "Error retrieving Twilio credentials", "error",
+					e.getMessage() == null ? "null" : e.getMessage()));
 			return Collections.emptyMap();
 		}
+	}
+
+	// Helper method for structured logging.
+	private void logStructured(Context context, String event, Map<String, Object> details) {
+		// Create a mutable copy of the provided details.
+		Map<String, Object> mutableDetails = new HashMap<>(details);
+		mutableDetails.put("event", event);
+		try {
+			String json = OBJECT_MAPPER.writeValueAsString(mutableDetails);
+			context.getLogger().log(json);
+		} catch (Exception e) {
+			context.getLogger().log("{\"event\":\"loggingError\", \"error\":\"" + e.getMessage() + "\"}");
+		}
+	}
+
+	// Static logging helper for static contexts.
+	private static void logStaticError(Context context, String message) {
+		context.getLogger().log("{\"event\":\"error\",\"message\":\"" + message + "\"}");
 	}
 }
